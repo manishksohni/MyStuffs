@@ -1,0 +1,86 @@
+# Azure DevOps Pipeline for Sitecore Patching
+trigger: none
+
+variables:
+  sourcePath: 'C:\Sitecore\wwwroot'
+  backupPath: 'C:\Sitecore\backups\$(Build.BuildId)'
+  patchSource: '$(Build.SourcesDirectory)\PatchFiles'
+  siteUrl: 'https://yoursitecoreapp.azurewebsites.net'
+  adminEmail: 'sitecore-support@yourcompany.com'
+
+stages:
+  - stage: Patching
+    displayName: 'Sitecore Patching'
+    jobs:
+      - job: PatchSitecore
+        displayName: 'Apply Patch to Sitecore Application'
+        pool:
+          name: 'your-agent-pool'
+        steps:
+          - task: PowerShell@2
+            displayName: 'Step 1: Backup Current Sitecore Files'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Backing up Sitecore files..."
+                New-Item -ItemType Directory -Path "$(backupPath)" -Force
+                Copy-Item -Path "$(sourcePath)\*" -Destination "$(backupPath)" -Recurse -Force
+
+          - task: PowerShell@2
+            displayName: 'Step 2: Apply Patch Files'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Applying patch files..."
+                Copy-Item -Path "$(patchSource)\*" -Destination "$(sourcePath)" -Recurse -Force
+
+          - task: PowerShell@2
+            displayName: 'Step 3: Validate Patch Files'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Validating patch files..."
+                # Example: validate presence of a known patched file
+                if (!(Test-Path "$(sourcePath)\App_Config\Include\PatchedConfig.config")) {
+                  Write-Error "Patch validation failed. File missing."
+                  exit 1
+                }
+
+          - task: PowerShell@2
+            displayName: 'Step 4: Restart IIS'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Restarting IIS..."
+                iisreset
+
+          - task: PowerShell@2
+            displayName: 'Step 5: Smoke Test Application URL'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Testing Sitecore URL..."
+                $response = Invoke-WebRequest -Uri "$(siteUrl)" -UseBasicParsing
+                if ($response.StatusCode -ne 200) {
+                  Write-Error "Site is not responding as expected."
+                  exit 1
+                }
+
+          - task: PowerShell@2
+            displayName: 'Step 6: Send Notification Email'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $emailTo = "$(adminEmail)"
+                $subject = "[Sitecore Patch] Application Patched Successfully"
+                $body = @"
+                <html>
+                <body>
+                  <p>Hello Team,</p>
+                  <p>The Sitecore application patching is completed successfully.</p>
+                  <p>You can access the application here: <a href='$(siteUrl)'>$(siteUrl)</a></p>
+                  <p>Regards,<br/>Azure DevOps Pipeline</p>
+                </body>
+                </html>
+                "@
+                Send-MailMessage -To $emailTo -From "noreply@yourcompany.com" -Subject $subject -Body $body -BodyAsHtml -SmtpServer "smtp.yourcompany.com"
