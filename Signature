@@ -1,0 +1,389 @@
+Program.cs
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.ApplicationInsights.Extensibility;
+
+var builder = FunctionsApplication.CreateBuilder(args);
+
+// Logging & AI
+builder.Services.AddApplicationInsightsTelemetryWorkerService();
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+
+// DI for Playwright singleton
+builder.Services.AddSingleton<PlaywrightHolder>();
+
+var app = builder.Build();
+app.Run();
+
+public sealed class PlaywrightHolder
+{
+    private Microsoft.Playwright.IPlaywright? _playwright;
+    private Microsoft.Playwright.IBrowser? _browser;
+    private readonly object _lock = new();
+
+    public async Task<Microsoft.Playwright.IBrowser> GetBrowserAsync()
+    {
+        if (_browser != null) return _browser;
+
+        lock (_lock)
+        {
+            if (_playwright == null)
+            {
+                // NOTE: if using container, browsers should already be installed
+                // For non-container, you can attempt: Microsoft.Playwright.Program.Main(new[] {"install", "--with-deps"});
+            }
+        }
+
+        _playwright ??= await Microsoft.Playwright.Playwright.CreateAsync();
+        _browser    ??= await _playwright.Chromium.LaunchAsync(new Microsoft.Playwright.BrowserTypeLaunchOptions
+        {
+            Headless = true,
+            Args = new[] { "--no-sandbox" } // required in many Linux environments
+        });
+
+        return _browser!;
+    }
+}
+
+===================================================================================================================
+
+HtmlToPdfWithSignature.cs
+
+
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using AngleSharp;
+using AngleSharp.Dom;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.Playwright;
+
+namespace MyCompany.Functions
+{
+    public class HtmlToPdfWithSignature
+    {
+        private readonly ILogger<HtmlToPdfWithSignature> _logger;
+        private readonly PlaywrightHolder _playwrightHolder;
+
+        public HtmlToPdfWithSignature(ILogger<HtmlToPdfWithSignature> logger, PlaywrightHolder playwrightHolder)
+        {
+            _logger = logger;
+            _playwrightHolder = playwrightHolder;
+        }
+
+        public class RequestModel
+        {
+            public string? Html { get; set; }
+            public string? SignatureBase64 { get; set; }
+            public string? SignatureUrl { get; set; }
+            public int? SignatureWidthPx { get; set; } = 220;
+            public int? SignatureHeightPx { get; set; } = 90;
+
+            public PlacementOptions? Placement { get; set; } = new PlacementOptions();
+            public PdfOptions? Pdf { get; set; } = new PdfOptions();
+            public string? ResourcesBaseUrl { get; set; }
+        }
+
+        public class PlacementOptions
+        {
+            public string? Mode { get; set; } = "token"; // "token" or "selector"
+            public string? Token { get; set; } = "{{SIGNATURE}}";
+            public string? Selector { get; set; } = "#signature";
+        }
+
+        public class PdfOptions
+        {
+            public string? Paper { get; set; } = "A4"; // e.g., "A4", "Letter"
+            public Margins? MarginMm { get; set; } = new Margins { Top = 10, Right = 10, Bottom = 10, Left = 10 };
+            public bool PrintBackground { get; set; } = true;
+        }
+
+        public class Margins { public double Top { get; set; } public double Right { get; set; } public double Bottom { get; set; } public double Left { get; set; } }
+
+        [Function("HtmlToPdfWithSignature")]
+        public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Function, "post", Route = "html-to-pdf-with-signature")] HttpRequestData req)
+        {
+            var correlationId = req.FunctionContext.InvocationId;
+            _logger.LogInformation("HtmlToPdfWithSignature invoked. CorrelationId={CorrelationId}", correlationId);
+
+            // Read JSON
+            string body = await new StreamReader(req.Body, Encoding.UTF8).ReadToEndAsync();
+            RequestModel? input = null;
+            try
+            {
+                input = JsonSerializer.Deserialize<RequestModel>(body, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Invalid JSON payload.");
+                return Problem(req, HttpStatusCode.BadRequest, "Invalid JSON payload.", correlationId);
+            }
+
+            // Validate
+            if (input == null || string.IsNullOrWhiteSpace(input.Html))
+                return Problem(req, HttpStatusCode.BadRequest, "html is required.", correlationId);
+            if (string.IsNullOrWhiteSpace(input.SignatureBase64) && string.IsNullOrWhiteSpace(input.SignatureUrl))
+                return Problem(req, HttpStatusCode.BadRequest, "signatureBase64 or signatureUrl is required.", correlationId);
+
+            // Prepare <img> data URI
+            string imgSrc;
+            if (!string.IsNullOrWhiteSpace(input.SignatureBase64))
+                imgSrc = $"data:image/png;base64,{input.SignatureBase64}";
+            else
+                imgSrc = input.SignatureUrl!; // URL will be loaded by browser
+
+            string style = $"width:{input.SignatureWidthPx}px; height:{input.SignatureHeightPx}px; object-fit:contain;";
+
+            // DOM-safe injection: use AngleSharp
+            var config = Configuration.Default;
+            var context = BrowsingContext.New(config);
+            var document = await context.OpenAsync(req => req.Content(input.Html!));
+
+            if ((input.Placement?.Mode ?? "token").Equals("selector", StringComparison.OrdinalIgnoreCase))
+            {
+                var el = document.QuerySelector(input.Placement!.Selector!);
+                if (el == null)
+                    return Problem(req, HttpStatusCode.BadRequest, $"selector '{input.Placement!.Selector}' not found.", correlationId);
+
+                var img = document.CreateElement("img");
+                img.SetAttribute("src", imgSrc);
+                img.SetAttribute("style", style);
+                img.SetAttribute("alt", "Signature");
+                el.AppendChild(img);
+            }
+            else
+            {
+                // token replacement mode
+                var htmlSerialized = document.DocumentElement.OuterHtml;
+                var signatureTag = $"<img src=\"{imgSrc}\" alt=\"Signature\" style=\"{style}\" />";
+                var token = input.Placement?.Token ?? "{{SIGNATURE}}";
+                if (!htmlSerialized.Contains(token))
+                {
+                    _logger.LogWarning("Token '{Token}' not found; appending signature at end of body.", token);
+                    var bodyEl = document.Body ?? document.DocumentElement;
+                    var img = document.CreateElement("img");
+                    img.SetAttribute("src", imgSrc);
+                    img.SetAttribute("style", style);
+                    img.SetAttribute("alt", "Signature");
+                    bodyEl.AppendChild(img);
+                }
+                else
+                {
+                    htmlSerialized = htmlSerialized.Replace(token, signatureTag);
+                    document = await context.OpenAsync(req => req.Content(htmlSerialized));
+                }
+            }
+
+            var finalHtml = document.DocumentElement.OuterHtml;
+
+            // Render HTML → PDF with Playwright
+            var browser = await _playwrightHolder.GetBrowserAsync();
+            using var contextPw = await browser.NewContextAsync(new BrowserNewContextOptions
+            {
+                BaseURL = input.ResourcesBaseUrl, // optional for relative assets
+                Locale = "en-US"
+            });
+            var page = await contextPw.NewPageAsync();
+            await page.SetContentAsync(finalHtml, new PageSetContentOptions { WaitUntil = WaitUntilState.NetworkIdle });
+
+            // PDF options
+            var pdfOpts = new PagePdfOptions
+            {
+                Format = input.Pdf?.Paper ?? "A4",
+                PrintBackground = input.Pdf?.PrintBackground ?? true,
+                Margin = new Margin
+                {
+                    Top = $"{input.Pdf?.MarginMm?.Top ?? 10}mm",
+                    Right = $"{input.Pdf?.MarginMm?.Right ?? 10}mm",
+                    Bottom = $"{input.Pdf?.MarginMm?.Bottom ?? 10}mm",
+                    Left = $"{input.Pdf?.MarginMm?.Left ?? 10}mm"
+                }
+            };
+
+            var pdfBytes = await page.PdfAsync(pdfOpts);
+            var pdfBase64 = Convert.ToBase64String(pdfBytes);
+
+            var resp = req.CreateResponse(HttpStatusCode.OK);
+            await resp.WriteStringAsync(JsonSerializer.Serialize(new { pdfBase64 }, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+            resp.Headers.Add("Content-Type", "application/json");
+            resp.Headers.Add("x-correlation-id", correlationId);
+            return resp;
+        }
+
+        private HttpResponseData Problem(HttpRequestData req, HttpStatusCode status, string title, string correlationId)
+        {
+            var resp = req.CreateResponse(status);
+            var payload = new { title, status = (int)status, traceId = correlationId };
+            resp.Headers.Add("Content-Type", "application/problem+json");
+            resp.Headers.Add("x-correlation-id", correlationId);
+            resp.WriteString(JsonSerializer.Serialize(payload));
+            return resp;
+        }
+    }
+}
+
+===========================================================================================================
+host.json
+
+{
+  "version": "2.0",
+  "logging": {
+    "logLevel": { "Function": "Information", "default": "Information" },
+    "applicationInsights": { "samplingSettings": { "isEnabled": true } }
+  }
+}
+
+==================================================
+
+NuGet packages
+
+Microsoft.Azure.Functions.Worker (isolated)
+AngleSharp
+Microsoft.Playwright
+
+===============================================================================================================
+
+Dockerfile (Linux)
+
+
+FROM mcr.microsoft.com/azure-functions/dotnet-isolated:4-dotnet-isolated8
+
+# Install Playwright dependencies and Chromium
+RUN apt-get update && apt-get install -y \
+    libnss3 libatk-bridge2.0-0 libxkbcommon0 libgbm1 libasound2 libxcomposite1 libxrandr2 libxi6 libxcursor1 libxdamage1 \
+    fonts-liberation libcups2 libdrm2 libu2f-udev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Optional: Arabic fonts (for UAE content)
+RUN apt-get update && apt-get install -y fonts-noto fonts-noto-cjk fonts-noto-unhinted fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy functions
+WORKDIR /home/site/wwwroot
+COPY . /home/site/wwwroot
+
+# Preinstall Playwright browsers at build time
+# Note: This requires the project to reference Microsoft.Playwright and include playwright.ps1
+RUN pwsh -Command "Set-Location /home/site/wwwroot; ./bin/Release/net8.0/playwright.ps1 install --with-deps chromium" || true
+
+===================================================================================================================
+
+App settings:
+
+FUNCTIONS_WORKER_RUNTIME=dotnet-isolated
+WEBSITE_RUN_FROM_PACKAGE=1 (if using zip deploy)
+Consider Premium plan to minimize cold starts.
+
+===================================================================================================================
+OpenAPI for Custom Connector (Power Apps)
+
+html-to-pdf-openapi.json 
+
+{
+  "openapi": "3.0.1",
+  "info": { "title": "HTML to PDF with Signature", "version": "1.0.0" },
+  "servers": [{ "url": "https://YOUR_FUNCTION_APP.azurewebsites.net" }],
+  "paths": {
+    "/api/html-to-pdf-with-signature": {
+      "post": {
+        "summary": "Convert HTML to PDF after injecting signature",
+        "operationId": "HtmlToPdfWithSignature",
+        "security": [{ "functionsKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Request" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PDF (base64)",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "pdfBase64": { "type": "string" } } }
+              }
+            }
+          },
+          "400": { "description": "Bad Request" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "functionsKey": { "type": "apiKey", "name": "x-functions-key", "in": "header" }
+    },
+    "schemas": {
+      "Request": {
+        "type": "object",
+        "required": ["html"],
+        "properties": {
+          "html": { "type": "string" },
+          "signatureBase64": { "type": "string" },
+          "signatureUrl": { "type": "string" },
+          "signatureWidthPx": { "type": "integer" },
+          "signatureHeightPx": { "type": "integer" },
+          "resourcesBaseUrl": { "type": "string" },
+          "placement": {
+            "type": "object",
+            "properties": {
+              "mode": { "type": "string", "enum": ["token","selector"] },
+              "token": { "type": "string" },
+              "selector": { "type": "string" }
+            }
+          },
+          "pdf": {
+            "type": "object",
+            "properties": {
+              "paper": { "type": "string" },
+              "printBackground": { "type": "boolean" },
+              "marginMm": {
+                "type": "object",
+                "properties": { "top": { "type": "number" }, "right": { "type": "number" }, "bottom": { "type": "number" }, "left": { "type": "number" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+==========================================================================================================
+
+Power Apps usage (example):
+
+
+// Build your HTML (maybe stored in a variable or from SharePoint)
+Set(htmlTemplate, HTMLInput.Text); // ensure it contains {{SIGNATURE}} or an element with id="signature"
+
+// Signature from the pen input (returns image stream)
+Set(sigBase64, Substitute(JSON(PenInputSignature.Image, JSONFormat.IncludeBinaryData), """", ""));
+
+// Call connector
+Set(
+  pdfResult,
+  HtmlToPdfConnector.HtmlToPdfWithSignature(
+    {
+      html: htmlTemplate,
+      signatureBase64: sigBase64,
+      placement: { mode: "token", token: "{{SIGNATURE}}" },
+      pdf: { paper: "A4", printBackground: true, marginMm: { top: 10, right: 10, bottom: 10, left: 10 } }
+    }
+  )
+);
+
+// Show in PDF Viewer (supports data URI)
+Set(pdfDataUri, Concatenate("data:application/pdf;base64,", pdfResult.pdfBase64));
+PDFViewer.Document = pdfDataUri;
+
+// Or save via Flow/SharePoint
+
